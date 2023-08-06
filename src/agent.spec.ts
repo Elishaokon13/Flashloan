@@ -55,7 +55,7 @@ describe("high tether transfer agent", () => {
         Finding.fromObject({
           name: "High Tether Transfer",
           description: `High amount of USDT transferred: ${normalizedValue}`,
-          alertId: "FORTA-1",
+          alertId: "Mev-1",
           severity: FindingSeverity.Low,
           type: FindingType.Info,
           metadata: {
