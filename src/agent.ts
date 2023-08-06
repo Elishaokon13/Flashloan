@@ -1,83 +1,74 @@
-import {
-  BlockEvent,
-  Finding,
-  Initialize,
-  HandleBlock,
-  HandleTransaction,
-  HandleAlert,
-  AlertEvent,
-  TransactionEvent,
-  FindingSeverity,
+import BigNumber from 'bignumber.js'
+import { 
+  Finding, 
+  HandleTransaction, 
+  TransactionEvent, 
+  FindingSeverity, 
   FindingType,
-} from "forta-agent";
+  getEthersProvider,
+  ethers,
+  getTransactionReceipt,
+  Receipt
+} from 'forta-agent'
 
-export const ERC20_TRANSFER_EVENT =
-  "event Transfer(address indexed from, address indexed to, uint256 value)";
-export const TETHER_ADDRESS = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
-export const TETHER_DECIMALS = 6;
-let findingsCount = 0;
+const HIGH_GAS_THRESHOLD = "7000000"
+const AAVE_V2_ADDRESS = "0x7d2768de32b0b80b7a3454c06bdac94a69ddc7a9"
+const FLASH_LOAN_EVENT = "event FlashLoan(address indexed target, address indexed initiator, address indexed asset, uint256 amount, uint256 premium, uint16 referralCode)"
+const INTERESTING_PROTOCOLS = ["0xacd43e627e64355f1861cec6d3a6688b31a6f952"]// Yearn Dai vault
+const BALANCE_DIFF_THRESHOLD = "200000000000000000000"// 200 eth
 
-const handleTransaction: HandleTransaction = async (
-  txEvent: TransactionEvent
-) => {
-  const findings: Finding[] = [];
+const ethersProvider = getEthersProvider()
 
-  // limiting this agent to emit only 5 findings so that the alert feed is not spammed
-  if (findingsCount >= 5) return findings;
+function provideHandleTransaction(
+  ethersProvider: ethers.providers.JsonRpcProvider,
+  getTransactionReceipt: (txHash: string) => Promise<Receipt>
+): HandleTransaction {
+  return async function handleTransaction(txEvent: TransactionEvent) {
+    // report finding if detected a flash loan attack on Yearn Dai vault
+    const findings: Finding[] = []
+  
+    // if aave not involved
+    if (!txEvent.addresses[AAVE_V2_ADDRESS]) return findings
+  
+    // if no flash loan events found
+    const flashLoanEvents = txEvent.filterLog(FLASH_LOAN_EVENT)
+    if (!flashLoanEvents.length) return findings
+  
+    // if does not involve a protocol we are interested in
+    const protocolAddress = INTERESTING_PROTOCOLS.find((address) => txEvent.addresses[address])
+    if (!protocolAddress) return findings
 
-  // filter the transaction logs for Tether transfer events
-  const tetherTransferEvents = txEvent.filterLog(
-    ERC20_TRANSFER_EVENT,
-    TETHER_ADDRESS
-  );
-
-  tetherTransferEvents.forEach((transferEvent) => {
-    // extract transfer event arguments
-    const { to, from, value } = transferEvent.args;
-    // shift decimals of transfer value
-    const normalizedValue = value.div(10 ** TETHER_DECIMALS);
-
-    // if more than 10,000 Tether were transferred, report it
-    if (normalizedValue.gt(10000)) {
-      findings.push(
-        Finding.fromObject({
-          name: "High Tether Transfer",
-          description: `High amount of USDT transferred: ${normalizedValue}`,
-          alertId: "Mev-1",
-          severity: FindingSeverity.Low,
-          type: FindingType.Info,
-          metadata: {
-            to,
-            from,
-          },
-        })
-      );
-      findingsCount++;
-    }
-  });
-
-  return findings;
-};
-
-// const initialize: Initialize = async () => {
-//   // do some initialization on startup e.g. fetch data
-// }
-
-// const handleBlock: HandleBlock = async (blockEvent: BlockEvent) => {
-//   const findings: Finding[] = [];
-//   // detect some block condition
-//   return findings;
-// }
-
-// const handleAlert: HandleAlert = async (alertEvent: AlertEvent) => {
-//   const findings: Finding[] = [];
-//   // detect some alert condition
-//   return findings;
-// }
+    // if gas too low
+    const  { gasUsed } = await getTransactionReceipt(txEvent.hash)
+    if (new BigNumber(gasUsed).isLessThan(HIGH_GAS_THRESHOLD)) return findings
+  
+    // if balance of affected contract address has not changed by threshold
+    const blockNumber = txEvent.blockNumber
+    const currentBalance = new BigNumber((await ethersProvider.getBalance(protocolAddress, blockNumber)).toString())
+    const previousBalance = new BigNumber((await ethersProvider.getBalance(protocolAddress, blockNumber-1)).toString())
+    const balanceDiff = previousBalance.minus(currentBalance)
+    if (balanceDiff.isLessThan(BALANCE_DIFF_THRESHOLD)) return findings
+  
+    findings.push(
+      Finding.fromObject({
+        name: "Flash Loan with Loss",
+        description: `Flash Loan with loss of ${balanceDiff.toString()} detected for ${protocolAddress}`,
+        alertId: "FORTA-5",
+        protocol: "aave",
+        type: FindingType.Suspicious,
+        severity: FindingSeverity.High,
+        metadata: {
+          protocolAddress,
+          balanceDiff: balanceDiff.toString(),
+          loans: JSON.stringify(flashLoanEvents)
+        },
+      }
+    ))
+    return findings
+  }
+}
 
 export default {
-  // initialize,
-  handleTransaction,
-  // handleBlock,
-  // handleAlert
-};
+  provideHandleTransaction,
+  handleTransaction: provideHandleTransaction(ethersProvider, getTransactionReceipt)
+}
